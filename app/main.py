@@ -1,10 +1,12 @@
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel
 import os
 import uvicorn
 import numpy as np
 from typing import List, Optional
 from pathlib import Path
+import asyncio
+import logging
 
 # Import our modules
 from .database import (
@@ -14,6 +16,7 @@ from .database import (
     save_face_to_db,
     get_db_status
 )
+from .photo_cleaner import run_photo_cleanup
 from .face_utils import (
     process_image,
     extract_face_embedding,
@@ -28,6 +31,10 @@ IMAGE_FOLDER = BASE_DIR / "reference_photos"
 
 # Crear el directorio de imágenes si no existe
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Modelos Pydantic ---
 class RecognitionResult(BaseModel):
@@ -63,14 +70,19 @@ async def startup_event():
                      if f.suffix.lower() in ['.jpg', '.jpeg', '.png']]
         print(f"Se encontraron {len(image_files)} imágenes de referencia.")
     
-    # Cargar rostros conocidos desde la base de datos
-    print("\nCargando rostros conocidos desde la base de datos...")
+    # Cargar los rostros conocidos desde la base de datos
     try:
-        global known_face_encodings, known_face_names
         known_face_encodings, known_face_names = load_known_faces_from_db()
-        print(f"Se cargaron {len(known_face_names)} rostros desde la base de datos.")
+        logger.info(f"[{len(known_face_names)}] rostros cargados desde la base de datos.")
+        if known_face_names:
+            logger.info(f"Personas reconocidas: {', '.join(known_face_names)}")
+        
+        # Start the background cleanup task
+        asyncio.create_task(run_photo_cleanup())
+        
     except Exception as e:
-        print(f"Error al cargar rostros desde la base de datos: {e}")
+        logger.error(f"Error al cargar los rostros desde la base de datos: {e}")
+        raise
     
     # Registrar automáticamente las imágenes en la carpeta reference_photos
     print("\nProcesando imágenes de referencia...")
@@ -141,19 +153,44 @@ async def register_face(
     # Leer la imagen
     contents = await file.read()
     
+    # Guardar la imagen en el sistema de archivos
+    try:
+        # Normalizar el nombre para usarlo como nombre de archivo
+        safe_name = "".join(c if c.isalnum() or c in ' .-_' else '_' for c in nombre)
+        file_extension = os.path.splitext(file.filename)[1] or '.jpg'
+        file_path = os.path.join(IMAGE_FOLDER, f"{safe_name}{file_extension}")
+        
+        # Guardar el archivo
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        logger.info(f"Imagen guardada en: {file_path}")
+    except Exception as e:
+        logger.error(f"Error al guardar la imagen: {e}")
+        raise HTTPException(status_code=500, detail=f"Error al guardar la imagen: {e}")
+    
     # Procesar y registrar el rostro
-    result = process_and_register_face(
-        image_data=contents,
-        nombre=nombre,
-        known_face_encodings=known_face_encodings,
-        known_face_names=known_face_names
-    )
-    
-    # Guardar el embedding en la base de datos
-    face_encoding = np.array(result['face_encoding'])
-    save_face_to_db(nombre, face_encoding)
-    
-    return result
+    try:
+        result = process_and_register_face(
+            image_data=contents,
+            nombre=nombre,
+            known_face_encodings=known_face_encodings,
+            known_face_names=known_face_names
+        )
+        
+        # Guardar el embedding en la base de datos
+        face_encoding = np.array(result['face_encoding'])
+        save_face_to_db(nombre, face_encoding)
+        
+        return result
+    except Exception as e:
+        # Si hay un error, intentar eliminar la imagen guardada
+        try:
+            if 'file_path' in locals() and os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Imagen eliminada debido a un error: {file_path}")
+        except Exception as cleanup_error:
+            logger.error(f"Error al limpiar la imagen después de un error: {cleanup_error}")
+        raise
 
 @app.post("/recognize_face/")
 async def recognize_face_endpoint(file: UploadFile = File(...)) -> RecognitionResult:
@@ -192,23 +229,64 @@ async def delete_face(nombre: str):
     """
     Elimina un rostro registrado del sistema.
     
-    - **nombre**: Nombre de la persona a eliminar
+    - **nombre**: Nombre de la persona a eliminar (no sensible a mayúsculas/minúsculas)
     """
     global known_face_encodings, known_face_names
     
-    if nombre not in known_face_names:
-        raise HTTPException(status_code=404, detail=f"No se encontró a '{nombre}' en los registros.")
+    # Normalizar el nombre (quitar espacios extra)
+    nombre = nombre.strip()
     
-    # Eliminar de la base de datos
-    if not delete_face_from_db(nombre):
-        raise HTTPException(status_code=404, detail=f"No se pudo eliminar a '{nombre}' de la base de datos.")
-    
-    # Eliminar de la memoria
-    index = known_face_names.index(nombre)
-    known_face_names.pop(index)
-    known_face_encodings.pop(index)
-    
-    return {"message": f"'{nombre}' ha sido eliminado del sistema."}
+    # Primero intentar eliminar directamente de la base de datos
+    try:
+        # Obtener conexión a la base de datos
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Buscar el nombre exacto en la base de datos (insensible a mayúsculas/minúsculas)
+        cur.execute("SELECT nombre FROM mis_personas WHERE LOWER(nombre) = LOWER(%s)", (nombre,))
+        result = cur.fetchone()
+        
+        if not result:
+            # Si no se encuentra, obtener la lista de nombres para el mensaje de error
+            cur.execute("SELECT nombre FROM mis_personas")
+            all_names = [row[0] for row in cur.fetchall()]
+            cur.close()
+            conn.close()
+            
+            raise HTTPException(
+                status_code=404,
+                detail=f"No se encontró a '{nombre}' en la base de datos. Nombres registrados: {', '.join(all_names) if all_names else 'Ninguno'}"
+            )
+        
+        # Obtener el nombre exacto como está en la base de datos
+        actual_name = result[0]
+        
+        # Eliminar de la base de datos
+        cur.execute("DELETE FROM mis_personas WHERE nombre = %s RETURNING nombre", (actual_name,))
+        deleted = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        if not deleted:
+            raise HTTPException(status_code=500, detail=f"Error al eliminar a '{actual_name}' de la base de datos.")
+        
+        # Actualizar la lista en memoria
+        if actual_name in known_face_names:
+            index = known_face_names.index(actual_name)
+            known_face_names.pop(index)
+            known_face_encodings.pop(index)
+        
+        return {"message": f"'{actual_name}' eliminado exitosamente del sistema."}
+        
+    except psycopg2.Error as e:
+        if 'conn' in locals() and conn:
+            conn.rollback()
+        logger.error(f"Error en la base de datos al eliminar: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en la base de datos: {e}")
+    except Exception as e:
+        logger.error(f"Error inesperado al eliminar: {e}")
+        raise HTTPException(status_code=500, detail=f"Error inesperado: {e}")
 
 @app.get("/list_known_faces/")
 async def list_known_faces():
