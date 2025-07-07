@@ -50,38 +50,78 @@ known_face_names: List[str] = []
 @app.on_event("startup")
 async def startup_event():
     """Se ejecuta cuando la aplicación FastAPI arranca."""
+    print("\n" + "="*50)
     print("Iniciando API de Reconocimiento Facial...")
+    print("="*50)
+    
+    # Verificar y mostrar la ruta de las fotos de referencia
+    print(f"\nBuscando fotos de referencia en: {IMAGE_FOLDER.absolute()}")
+    if not IMAGE_FOLDER.exists():
+        print(f"¡Error! No se encontró el directorio: {IMAGE_FOLDER}")
+    else:
+        image_files = [f for f in IMAGE_FOLDER.glob('*') 
+                     if f.suffix.lower() in ['.jpg', '.jpeg', '.png']]
+        print(f"Se encontraron {len(image_files)} imágenes de referencia.")
     
     # Cargar rostros conocidos desde la base de datos
-    global known_face_encodings, known_face_names
-    known_face_encodings, known_face_names = load_known_faces_from_db()
+    print("\nCargando rostros conocidos desde la base de datos...")
+    try:
+        global known_face_encodings, known_face_names
+        known_face_encodings, known_face_names = load_known_faces_from_db()
+        print(f"Se cargaron {len(known_face_names)} rostros desde la base de datos.")
+    except Exception as e:
+        print(f"Error al cargar rostros desde la base de datos: {e}")
     
     # Registrar automáticamente las imágenes en la carpeta reference_photos
-    for filename in os.listdir(IMAGE_FOLDER):
-        if filename.lower().endswith((".png", ".jpg", ".jpeg")):
-            nombre = os.path.splitext(filename)[0]
-            local_image_path = os.path.join(IMAGE_FOLDER, filename)
+    print("\nProcesando imágenes de referencia...")
+    registered_count = 0
+    error_count = 0
+    
+    for img_path in IMAGE_FOLDER.glob('*'):
+        if img_path.suffix.lower() not in ['.jpg', '.jpeg', '.png']:
+            continue
             
-            try:
-                with open(local_image_path, 'rb') as f:
-                    image_data = f.read()
-                
-                # Procesar y registrar el rostro
-                result = process_and_register_face(
-                    image_data=image_data,
-                    nombre=nombre,
-                    known_face_encodings=known_face_encodings,
-                    known_face_names=known_face_names
-                )
-                
-                # Guardar el embedding en la base de datos
-                face_encoding = np.array(result['face_encoding'])
-                save_face_to_db(nombre, face_encoding)
-                
-                print(f"Registrado automáticamente: {nombre}")
-                
-            except Exception as e:
-                print(f"Error al registrar {nombre}: {e}")
+        nombre = img_path.stem
+        print(f"\nProcesando: {img_path.name}")
+        
+        try:
+            # Leer la imagen
+            with open(img_path, 'rb') as f:
+                image_data = f.read()
+            
+            # Verificar si la imagen ya está registrada
+            if nombre in known_face_names:
+                print(f"  - {nombre} ya está registrado. Actualizando...")
+            
+            # Procesar y registrar el rostro
+            print("  - Extrayendo características faciales...")
+            result = process_and_register_face(
+                image_data=image_data,
+                nombre=nombre,
+                known_face_encodings=known_face_encodings,
+                known_face_names=known_face_names
+            )
+            
+            # Guardar el embedding en la base de datos
+            print("  - Guardando en la base de datos...")
+            face_encoding = np.array(result['face_encoding'])
+            save_face_to_db(nombre, face_encoding)
+            
+            print(f"  - ✓ {nombre} registrado/actualizado exitosamente.")
+            registered_count += 1
+            
+        except Exception as e:
+            error_count += 1
+            print(f"  - ✗ Error al procesar {img_path.name}: {str(e)}")
+    
+    # Mostrar resumen
+    print("\n" + "="*50)
+    print("Resumen de inicio:")
+    print(f"- Imágenes de referencia encontradas: {len(list(IMAGE_FOLDER.glob('*.jp*g'))) + len(list(IMAGE_FOLDER.glob('*.png')))}")
+    print(f"- Rostros registrados exitosamente: {registered_count}")
+    print(f"- Errores durante el registro: {error_count}")
+    print(f"- Total de rostros cargados: {len(known_face_names)}")
+    print("="*50 + "\n")
 
 # --- Endpoints de la API ---
 @app.post("/register_face/")
