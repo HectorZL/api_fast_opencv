@@ -1,0 +1,9 @@
+# Entornos virtuales
+nombre_de_tu_env/
+venv/
+ENV/
+env/
+__pycache__/
+
+# Directorio de fotos de referencia
+reference_photos/
