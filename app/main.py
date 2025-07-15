@@ -16,12 +16,12 @@ from .database import (
     save_face_to_db,
     get_db_status
 )
-from .photo_cleaner import run_photo_cleanup
+from .photo_cleaner import cleanup_orphaned_photos
 from .face_utils import (
     process_image,
     extract_face_embedding,
     recognize_face as recognize_face_util,
-    process_and_register_face,
+    is_face_duplicate,
     FaceRecognitionResult
 )
 
@@ -77,9 +77,7 @@ async def startup_event():
         if known_face_names:
             logger.info(f"Personas reconocidas: {', '.join(known_face_names)}")
         
-        # Start the background cleanup task
-        asyncio.create_task(run_photo_cleanup())
-        
+        print("\n" + "="*50)
     except Exception as e:
         logger.error(f"Error al cargar los rostros desde la base de datos: {e}")
         raise
@@ -96,35 +94,60 @@ async def startup_event():
         nombre = img_path.stem
         print(f"\nProcesando: {img_path.name}")
         
+        # Leer la imagen
         try:
-            # Leer la imagen
             with open(img_path, 'rb') as f:
                 image_data = f.read()
+        except Exception as e:
+            print(f"  - ✗ Error al leer la imagen {img_path.name}: {str(e)}")
+            error_count += 1
+            continue
+        
+        # Verificar si la imagen ya está registrada
+        if nombre in known_face_names:
+            print(f"  - {nombre} ya está registrado. Actualizando...")
+        
+        # Procesar y registrar el rostro
+        print(f"  - Procesando imagen: {img_path.name}")
+        try:
+            # Procesar la imagen primero
+            rgb_image, _ = process_image(image_data)
             
-            # Verificar si la imagen ya está registrada
-            if nombre in known_face_names:
-                print(f"  - {nombre} ya está registrado. Actualizando...")
+            # Extraer el embedding
+            success, face_encoding, face_metadata = extract_face_embedding(rgb_image)
             
-            # Procesar y registrar el rostro
-            print("  - Extrayendo características faciales...")
-            result = process_and_register_face(
-                image_data=image_data,
-                nombre=nombre,
-                known_face_encodings=known_face_encodings,
-                known_face_names=known_face_names
+            if not success or face_encoding is None:
+                error_msg = face_metadata.get('error', 'No se pudo extraer el rostro')
+                print(f"  - ✗ Error al procesar {img_path.name}: {error_msg}")
+                error_count += 1
+                continue
+            
+            # Verificar si ya existe un rostro similar
+            is_duplicate, duplicate_name, _ = is_face_duplicate(
+                face_encoding,
+                known_face_encodings,
+                known_face_names
             )
             
-            # Guardar el embedding en la base de datos
-            print("  - Guardando en la base de datos...")
-            face_encoding = np.array(result['face_encoding'])
-            save_face_to_db(nombre, face_encoding)
+            if is_duplicate:
+                print(f"  - ⚠ Rostro de '{nombre}' ya existe como '{duplicate_name}'. Omitiendo...")
+                error_count += 1
+                continue
             
-            print(f"  - ✓ {nombre} registrado/actualizado exitosamente.")
+            # Si llegamos aquí, es un rostro nuevo
+            known_face_encodings.append(face_encoding)
+            known_face_names.append(nombre)
+            
+            # Guardar en la base de datos
+            print("  - Guardando en la base de datos...")
+            save_face_to_db(nombre, face_encoding)
+            print(f"  - ✓ {nombre} registrado exitosamente.")
             registered_count += 1
             
         except Exception as e:
+            error_msg = str(e)
+            print(f"  - ✗ Error al procesar {img_path.name}: {error_msg}")
             error_count += 1
-            print(f"  - ✗ Error al procesar {img_path.name}: {str(e)}")
     
     # Mostrar resumen
     print("\n" + "="*50)
@@ -168,20 +191,41 @@ async def register_face(
         logger.error(f"Error al guardar la imagen: {e}")
         raise HTTPException(status_code=500, detail=f"Error al guardar la imagen: {e}")
     
-    # Procesar y registrar el rostro
+    # Procesar la imagen
     try:
-        result = process_and_register_face(
-            image_data=contents,
-            nombre=nombre,
-            known_face_encodings=known_face_encodings,
-            known_face_names=known_face_names
+        # Procesar la imagen primero
+        rgb_image, _ = process_image(contents)
+        
+        # Extraer el embedding
+        success, face_encoding, face_metadata = extract_face_embedding(rgb_image)
+        
+        if not success or face_encoding is None:
+            error_msg = face_metadata.get('error', 'No se pudo extraer el rostro')
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        # Verificar si ya existe un rostro similar
+        is_duplicate, duplicate_name, _ = is_face_duplicate(
+            face_encoding,
+            known_face_encodings,
+            known_face_names
         )
         
-        # Guardar el embedding en la base de datos
-        face_encoding = np.array(result['face_encoding'])
+        if is_duplicate:
+            return {"message": f"El rostro ya está registrado como '{duplicate_name}'"}
+        
+        # Guardar en la base de datos
         save_face_to_db(nombre, face_encoding)
         
-        return result
+        # Actualizar las listas en memoria
+        known_face_encodings.append(face_encoding)
+        known_face_names.append(nombre)
+        
+        return {
+            "message": f"'{nombre}' registrado exitosamente.",
+            "name": nombre,
+            "is_duplicate": False,
+            "face_encoding": face_encoding.tolist()
+        }
     except Exception as e:
         # Si hay un error, intentar eliminar la imagen guardada
         try:
@@ -204,12 +248,15 @@ async def recognize_face_endpoint(file: UploadFile = File(...)) -> RecognitionRe
     
     # Leer y procesar la imagen
     contents = await file.read()
-    rgb_image = process_image(contents)
+    rgb_image, metadata = process_image(contents)
     
     # Extraer el rostro
-    success, face_encoding = extract_face_embedding(rgb_image)
+    success, face_encoding, face_metadata = extract_face_embedding(rgb_image)
     if not success or face_encoding is None:
-        return RecognitionResult(name="No se detectó ningún rostro", is_known=False)
+        error_msg = "No se detectó ningún rostro en la imagen."
+        if metadata.get('is_blurry', False):
+            error_msg += f" La imagen parece estar borrosa (varianza Laplaciano: {metadata['blur_variance']:.2f})."
+        return RecognitionResult(name=error_msg, is_known=False)
     
     # Reconocer el rostro
     result = recognize_face_util(
@@ -227,7 +274,7 @@ async def recognize_face_endpoint(file: UploadFile = File(...)) -> RecognitionRe
 @app.delete("/delete_face/{nombre}")
 async def delete_face(nombre: str):
     """
-    Elimina un rostro registrado del sistema.
+    Elimina un rostro registrado del sistema y limpia las fotos asociadas.
     
     - **nombre**: Nombre de la persona a eliminar (no sensible a mayúsculas/minúsculas)
     """
@@ -242,32 +289,24 @@ async def delete_face(nombre: str):
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Buscar el nombre exacto en la base de datos (insensible a mayúsculas/minúsculas)
+        # Buscar el nombre exacto (case-insensitive)
         cur.execute("SELECT nombre FROM mis_personas WHERE LOWER(nombre) = LOWER(%s)", (nombre,))
         result = cur.fetchone()
         
         if not result:
-            # Si no se encuentra, obtener la lista de nombres para el mensaje de error
-            cur.execute("SELECT nombre FROM mis_personas")
-            all_names = [row[0] for row in cur.fetchall()]
-            cur.close()
-            conn.close()
+            raise HTTPException(status_code=404, detail=f"No se encontró a '{nombre}' en el sistema.")
             
-            raise HTTPException(
-                status_code=404,
-                detail=f"No se encontró a '{nombre}' en la base de datos. Nombres registrados: {', '.join(all_names) if all_names else 'Ninguno'}"
-            )
-        
-        # Obtener el nombre exacto como está en la base de datos
-        actual_name = result[0]
+        actual_name = result[0]  # Nombre exacto en la base de datos
         
         # Eliminar de la base de datos
-        cur.execute("DELETE FROM mis_personas WHERE nombre = %s RETURNING nombre", (actual_name,))
-        deleted = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
+        delete_face_from_db(actual_name)
         
+        # Actualizar las listas en memoria
+        for i, name in enumerate(known_face_names):
+            if name.lower() == actual_name.lower():
+                known_face_names.pop(i)
+                known_face_encodings.pop(i)
+                break
         if not deleted:
             raise HTTPException(status_code=500, detail=f"Error al eliminar a '{actual_name}' de la base de datos.")
         
