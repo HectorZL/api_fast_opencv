@@ -1,10 +1,12 @@
 import os
-import psycopg2
-import base64
+import mysql.connector
+from mysql.connector import Error
+from dotenv import load_dotenv
+from fastapi import HTTPException
 import json
 import numpy as np
-from fastapi import HTTPException
-from dotenv import load_dotenv
+from typing import List, Tuple, Optional
+import base64
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -12,19 +14,19 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 # Load environment variables
 load_dotenv()
 
-# Database configuration from environment variables
+# Database configuration
 DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "database": os.getenv("DB_NAME", "mi_base_de_datos"),
-    "user": os.getenv("DB_USER", "mi_usuario"),
-    "password": os.getenv("DB_PASSWORD", "mi_contraseña_segura")
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'database': os.getenv('DB_NAME', 'midbnew'),
+    'user': os.getenv('DB_USER', 'mi_usuario'),
+    'password': os.getenv('DB_PASSWORD', 'mi_contraseña'),
+    'port': int(os.getenv('DB_PORT', 3306))
 }
 
 # Get secret key from environment and derive a Fernet key
 SECRET_KEY = os.getenv("SECRET_KEY", "default-secret-key-please-change-me")
 salt = b'salt_'  # You might want to store this more securely in production
 
-# Derive a 32-byte key from the secret key using PBKDF2
 def get_fernet_key():
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
@@ -39,10 +41,8 @@ fernet = Fernet(get_fernet_key())
 
 def encrypt_data(data):
     """Encrypt data using Fernet symmetric encryption."""
-    # Convert numpy array to JSON string if it's a numpy array
     if isinstance(data, np.ndarray):
         data = json.dumps(data.tolist())
-    # If it's already a string, ensure it's bytes
     if isinstance(data, str):
         data = data.encode()
     return fernet.encrypt(data).decode()
@@ -53,7 +53,6 @@ def decrypt_data(encrypted_data):
         return None
     try:
         decrypted = fernet.decrypt(encrypted_data.encode() if isinstance(encrypted_data, str) else encrypted_data)
-        # Try to convert back to numpy array if it was a JSON array
         try:
             return np.array(json.loads(decrypted.decode()))
         except (json.JSONDecodeError, ValueError):
@@ -63,13 +62,151 @@ def decrypt_data(encrypted_data):
         return None
 
 def get_db_connection():
-    """Helper para obtener una conexión a la DB."""
+    """Get a database connection."""
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = mysql.connector.connect(**DB_CONFIG)
         return conn
-    except psycopg2.Error as e:
-        print(f"Error al conectar a la base de datos: {e}")
-        raise HTTPException(status_code=500, detail=f"No se pudo conectar a la base de datos: {e}")
+    except Error as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error connecting to MySQL database: {e}"
+        )
+
+def save_face_embedding(nombre: str, embedding: List[float]) -> int:
+    """Save or update a face embedding in the database."""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        try:
+            # Convert the embedding list to a JSON string and then to bytes
+            embedding_json = json.dumps(embedding)
+            encrypted_embedding = encrypt_data(embedding_json)
+        except Exception as e:
+            print(f"Error encrypting data: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error encrypting face data: {str(e)}")
+        
+        # Check if person already exists
+        cursor.execute(
+            "SELECT id FROM personas WHERE nombre = %s AND estado = 1",
+            (nombre,)
+        )
+        person = cursor.fetchone()
+        
+        if person:
+            # Update existing record
+            cursor.execute(
+                """UPDATE personas 
+                   SET codigo_embedding = %s, 
+                       estado = 1,
+                       fecha_actualizacion = CURRENT_TIMESTAMP
+                   WHERE id = %s""",
+                (encrypted_embedding, person['id'])
+            )
+            person_id = person['id']
+        else:
+            # Insert new record
+            cursor.execute(
+                """INSERT INTO personas 
+                   (nombre, codigo_embedding, estado) 
+                   VALUES (%s, %s, 1)""",
+                (nombre, encrypted_embedding)
+            )
+            person_id = cursor.lastrowid
+        
+        conn.commit()
+        return person_id
+        
+    except Error as e:
+        if conn and conn.is_connected():
+            conn.rollback()
+        print(f"Database error in save_face_embedding: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error: {str(e)}"
+        )
+    except Exception as e:
+        if conn and conn.is_connected():
+            conn.rollback()
+        print(f"Unexpected error in save_face_embedding: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+def get_face_embeddings() -> List[Tuple[int, str, List[float]]]:
+    """Retrieve all face embeddings from the database."""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        cursor.execute(
+            "SELECT id, nombre, codigo_embedding FROM personas WHERE estado = 1"
+        )
+        
+        results = []
+        for row in cursor:
+            try:
+                # Decrypt the embedding
+                embedding = decrypt_data(row['codigo_embedding'])
+                results.append((
+                    row['id'],
+                    row['nombre'],
+                    embedding
+                ))
+            except (json.JSONDecodeError, KeyError):
+                continue
+                
+        return results
+        
+    except Error as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving face embeddings: {e}"
+        )
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+def delete_face(persona_id: int) -> bool:
+    """Delete a face from the database (soft delete)."""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "UPDATE personas SET estado = 0 WHERE id = %s",
+            (persona_id,)
+        )
+        conn.commit()
+        
+        return cursor.rowcount > 0
+        
+    except Error as e:
+        if conn and conn.is_connected():
+            conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error deleting face: {e}"
+        )
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
 
 def load_known_faces_from_db():
     """Carga nombres y embeddings (no nulos) desde la base de datos para reconocimiento."""
@@ -79,112 +216,47 @@ def load_known_faces_from_db():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor()
-        # Seleccionamos solo las entradas que tienen un encoding_hash (no es NULL)
-        cur.execute("SELECT nombre, encoding_hash FROM mis_personas WHERE encoding_hash IS NOT NULL")
-        rows = cur.fetchall()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT nombre, codigo_embedding FROM personas WHERE estado = 1")
+        rows = cursor.fetchall()
         
-        for nombre, encrypted_embedding in rows:
+        for row in rows:
+            nombre = row['nombre']
+            encrypted_embedding = row['codigo_embedding']
+            
             # Desencriptar el embedding
-            embedding_data = decrypt_data(encrypted_embedding)
-            if embedding_data is not None:
-                known_face_names.append(nombre)
-                known_face_encodings.append(embedding_data)
+            try:
+                embedding = decrypt_data(encrypted_embedding)
+                if embedding is not None:
+                    known_face_encodings.append(embedding)
+                    known_face_names.append(nombre)
+            except Exception as e:
+                print(f"Error al desencriptar embedding para {nombre}: {e}")
         
         print(f"[{len(known_face_names)}] rostros (embeddings) cargados de la base de datos.")
         if known_face_names:
             print(f"Personas cargadas: {', '.join(known_face_names)}")
 
-    except HTTPException: # Re-lanzar si la conexión falló en get_db_connection
-        raise
-    except psycopg2.Error as e:
+        return known_face_encodings, known_face_names
+        
+    except Error as e:
         print(f"Error al cargar rostros/embeddings de la DB: {e}")
         raise HTTPException(status_code=500, detail=f"Error en la base de datos al cargar rostros: {e}")
-    except Exception as e:
-        print(f"Error inesperado al cargar rostros: {e}")
-        raise HTTPException(status_code=500, detail=f"Error inesperado al cargar rostros: {e}")
     finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    return known_face_encodings, known_face_names
-
-def delete_face_from_db(nombre: str):
-    """Elimina una persona de la base de datos por su nombre."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM mis_personas WHERE nombre = %s", (nombre,))
-        conn.commit()
-        return cur.rowcount > 0
-    except psycopg2.Error as e:
-        if conn:
-            conn.rollback()
-        print(f"Error en la base de datos al eliminar: {e}")
-        raise HTTPException(status_code=500, detail=f"Error en la base de datos al eliminar: {e}")
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"Error inesperado al eliminar de la base de datos: {e}")
-        raise HTTPException(status_code=500, detail=f"Error inesperado al eliminar: {e}")
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-
-def save_face_to_db(nombre: str, embedding):
-    """Guarda un nuevo rostro o actualiza uno existente en la base de datos."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Encriptar el embedding antes de guardarlo
-        encrypted_embedding = encrypt_data(embedding)
-        
-        # Verificar si ya existe un registro con el mismo nombre
-        cur.execute("SELECT 1 FROM mis_personas WHERE nombre = %s", (nombre,))
-        if cur.fetchone():
-            # Actualizar el registro existente
-            cur.execute(
-                "UPDATE mis_personas SET encoding_hash = %s WHERE nombre = %s",
-                (encrypted_embedding, nombre)
-            )
-        else:
-            # Insertar un nuevo registro
-            cur.execute(
-                "INSERT INTO mis_personas (nombre, encoding_hash) VALUES (%s, %s)",
-                (nombre, encrypted_embedding)
-            )
-        conn.commit()
-        return True
-    except psycopg2.Error as e:
-        if conn:
-            conn.rollback()
-        print(f"Error al guardar en la base de datos: {e}")
-        raise HTTPException(status_code=500, detail=f"Error al guardar en la base de datos: {e}")
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"Error inesperado al guardar en la base de datos: {e}")
-        raise HTTPException(status_code=500, detail=f"Error inesperado al guardar en la base de datos: {e}")
-    finally:
-        if conn:
-            cur.close()
+        if conn and conn.is_connected():
+            cursor.close()
             conn.close()
 
 def get_db_status():
     """Verifica el estado de la conexión a la base de datos."""
     try:
         conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
         return "Conectado"
     except Exception as e:
         return f"Error de conexión: {str(e)}"
     finally:
-        if 'conn' in locals():
-            cur.close()
+        if 'conn' in locals() and conn.is_connected():
+            cursor.close()
             conn.close()
